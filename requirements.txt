@@ -7,3 +7,5 @@ faiss-cpu
 pypdf
 python-dotenv
 streamlit
+prometheus-client
+flask

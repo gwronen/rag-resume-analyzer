@@ -1,180 +1,192 @@
 import os
+import time
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Imports המותאמים לגרסאות החדשות
+# Imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate  # <--- זה השינוי הקריטי
+from langchain_core.prompts import PromptTemplate
 
-# Load environment variables
+# Watchdog
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# Prometheus metrics
+from prometheus_client import start_http_server, Counter, Histogram, Gauge, REGISTRY
+
+# פונקציית עזר למניעת כפילויות במטריקות
+def get_metric(cls, name, desc, labelnames=None):
+    if name in REGISTRY._names_to_collectors:
+        return REGISTRY._names_to_collectors[name]
+    if labelnames:
+        return cls(name, desc, labelnames)
+    return cls(name, desc)
+
+# הגדרת המטריקות
+_pdf_processed_total = get_metric(Counter, 'rag_pdf_processed_total', 'Total number of PDFs indexed')
+_questions_total = get_metric(Counter, 'rag_questions_total', 'Total questions asked', ['status'])
+_question_duration = get_metric(Histogram, 'rag_question_duration_seconds', 'Time spent processing questions')
+_documents_loaded = get_metric(Gauge, 'rag_documents_loaded', 'Number of documents in the current session')
+
 load_dotenv()
 
 class RAGPipeline:
     def __init__(self, data_folder="./data", index_path="./faiss_index"):
         self.data_folder = Path(data_folder)
         self.index_path = Path(index_path)
-        
-        # Get OpenAI API key from environment (.env file)
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment variables.")
-        
-        # OpenAIEmbeddings automatically reads OPENAI_API_KEY from environment
         self.embeddings = OpenAIEmbeddings()
         self.vectorstore = None
-        
-        # אתחול מודל השפה (LLM)
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.data_folder.mkdir(exist_ok=True)
+        self.load_index()
 
     def load_pdfs(self):
-        documents = []
-        pdf_files = list(self.data_folder.glob("*.pdf"))
-        if not pdf_files:
-            return documents
+        """סורק את כל תיקיית ה-data ומחזיר רשימת מסמכים"""
+        all_docs = []
+        if not self.data_folder.exists():
+            return []
+        pdf_files = [f for f in os.listdir(self.data_folder) if f.endswith(".pdf")]
+        print(f"📂 Found {len(pdf_files)} PDF files: {pdf_files}")
         
-        for pdf_file in pdf_files:
+        for file in pdf_files:
             try:
-                loader = PyPDFLoader(str(pdf_file))
-                docs = loader.load()
-                documents.extend(docs)
+                loader = PyPDFLoader(str(self.data_folder / file))
+                all_docs.extend(loader.load())
             except Exception as e:
-                print(f"Error loading {pdf_file.name}: {e}")
-        return documents
+                print(f"❌ Error loading {file}: {e}")
+        
+        _documents_loaded.set(len(pdf_files))
+        return all_docs
 
-    def chunk_documents(self, documents, chunk_size=1000, chunk_overlap=200):
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-        )
-        return text_splitter.split_documents(documents)
+    def chunk_documents(self, docs):
+        """מפרק מסמכים לקטעים"""
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        return text_splitter.split_documents(docs)
 
     def create_and_save_index(self, chunks):
-        if not chunks: return
+        """יוצר אינדקס חדש ושומר לדיסק"""
+        if not chunks:
+            return False
         self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
         self.vectorstore.save_local(str(self.index_path))
-
-    def load_index(self):
-        if not self.index_path.exists(): return False
-        self.vectorstore = FAISS.load_local(
-            str(self.index_path),
-            self.embeddings,
-            allow_dangerous_deserialization=True
-        )
         return True
 
-    def ask_question(self, query, k=8):
-        """
-        Retrieval + Generation: מוצא את המידע ועונה תשובה אנושית.
-        """
-        if self.vectorstore is None:
-            return "Error: Index not initialized."
-
-        # 1. Retrieval: מציאת הקטעים הרלוונטיים (Context)
-        # אם שואלים על שמות, נחפש גם באופן כללי יותר
-        search_query = query
-        if any(word in query.lower() for word in ['name', 'names', 'candidate', 'candidates', 'who', 'מי']):
-            # חיפוש כללי יותר למציאת שמות
-            search_query = query + " personal information contact details header"
-            k = max(k, 10)  # יותר קטעים לחיפוש שמות
-        
-        docs = self.vectorstore.similarity_search(search_query, k=k)
-        
-        # איסוף כל המקורות הייחודיים
-        unique_sources = set()
-        for doc in docs:
-            source = doc.metadata.get('source', '')
-            if source:
-                unique_sources.add(Path(source).stem)
-        
-        # בניית context עם מידע על המקור
-        context_parts = []
-        for i, doc in enumerate(docs, 1):
-            source = doc.metadata.get('source', 'Unknown')
-            page = doc.metadata.get('page', 'N/A')
-            filename = Path(source).name
-            context_parts.append(f"[Document {i} - File: {filename}, Page {page}]\n{doc.page_content}")
-        
-        context_text = "\n\n---\n\n".join(context_parts)
-        
-        # הוספת רשימת קבצים למידע נוסף
-        if unique_sources:
-            files_info = f"\nAvailable resume files: {', '.join(sorted(unique_sources))}"
-            context_text = context_text + files_info
-
-        # 2. Prompt: בניית ההנחיה ל-AI - יותר ספציפי לחילוץ מידע
-        template = """You are a professional assistant analyzing resumes and documents. 
-Answer the question based ONLY on the provided context. Extract specific information like names, dates, skills, etc.
-
-When answering:
-- If asked about names, list ALL names you find in the context - check the document content AND filenames
-- Names are often at the top/beginning of documents
-- If asked about candidates, identify each candidate by their name from the documents
-- Extract names from both the document content and the file names if provided
-- Be specific and extract concrete information
-- If the information is not in the context, say "I don't have enough information in the provided documents"
-        
-Context from documents:
-{context}
-        
-Question: {question}
-        
-Provide a clear, specific answer based on the context above:"""
-        
-        prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-        
-        # 3. Generation: שליחה ל-OpenAI לקבלת תשובה מסוכמת
-        chain = prompt | self.llm
-        response = chain.invoke({"context": context_text, "question": query})
-        
-        return response.content
-
-def main():
-    try:
-        pipeline = RAGPipeline()
-    except ValueError as e:
-        print(f"Error: {e}")
-        return
-    
-    if pipeline.index_path.exists():
-        print("\n[INFO] Loading existing index...")
-        pipeline.load_index()
-    else:
-        pipeline.data_folder.mkdir(exist_ok=True)
-        print("\n=== Processing Documents ===")
-        documents = pipeline.load_pdfs()
-        if not documents:
-            print("[!] Please add PDFs to the /data folder.")
-            return
-        chunks = pipeline.chunk_documents(documents)
-        pipeline.create_and_save_index(chunks)
-        print("[SUCCESS] Index created.")
-
-    print("\n" + "="*40)
-    print("🚀 AI RAG System Ready!")
-    print("Ask me anything about your documents.")
-    print("="*40)
-    
-    while True:
+    def process_single_pdf(self, pdf_path):
+        """מעבד קובץ בודד עבור ה-Watchdog"""
         try:
-            query = input("\n🔍 Your Question: ").strip()
-            if query.lower() in ['exit', 'quit', 'q', 'יציאה']:
-                break
-            if not query: continue
-            
-            print("⏳ Thinking...")
-            answer = pipeline.ask_question(query)
-            
-            print("\n📢 Answer:")
-            print("-" * 30)
-            print(answer)
-            print("-" * 30)
-            
+            loader = PyPDFLoader(str(pdf_path))
+            docs = loader.load()
+            chunks = self.chunk_documents(docs)
+            if self.vectorstore is None:
+                self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
+            else:
+                new_vs = FAISS.from_documents(chunks, self.embeddings)
+                self.vectorstore.merge_from(new_vs)
+            self.vectorstore.save_local(str(self.index_path))
+            _pdf_processed_total.inc()
+            pdf_count = len([f for f in os.listdir(self.data_folder) if f.endswith(".pdf")])
+            _documents_loaded.set(pdf_count)
         except Exception as e:
-            print(f"\n[!] Error: {e}")
+            print(f"❌ Error: {e}")
+
+    def load_index(self):
+        """טוען אינדקס קיים מהדיסק"""
+        if self.index_path.exists():
+            try:
+                self.vectorstore = FAISS.load_local(
+                    str(self.index_path), self.embeddings, allow_dangerous_deserialization=True
+                )
+                pdf_files = len([f for f in os.listdir(self.data_folder) if f.endswith(".pdf")])
+                _documents_loaded.set(pdf_files)
+                return True
+            except:
+                return False
+        return False
+
+    def ask_question(self, query):
+        """מבצע חיפוש ועונה על השאלה עם ציון המקורות"""
+        if self.vectorstore is None:
+            return "No documents indexed yet."
+
+        start_time = time.time()
+        # שליפת 10 קטעים כדי לוודא שכל המועמדים נלקחים בחשבון
+        docs = self.vectorstore.similarity_search(query, k=10)
+        
+        context_parts = []
+        found_sources = set()
+
+        for d in docs:
+            source_path = d.metadata.get('source', 'Unknown')
+            file_name = os.path.basename(source_path)
+            found_sources.add(file_name)
+            context_parts.append(f"Source [{file_name}]:\n{d.page_content}")
+        
+        context = "\n\n".join(context_parts)
+        
+        template = """You are a professional HR recruiter. 
+        You have access to resumes from {num_docs} candidates: {sources}.
+        Use the provided context to answer the question accurately.
+        
+        Context:
+        {context}
+
+        Question: {question}
+        
+        Helpful Answer:"""
+        
+        prompt = PromptTemplate(
+            template=template, 
+            input_variables=["context", "question", "num_docs", "sources"]
+        )
+        
+        try:
+            chain = prompt | self.llm
+            response = chain.invoke({
+                "context": context, 
+                "question": query,
+                "num_docs": len(found_sources),
+                "sources": ", ".join(found_sources)
+            })
+            
+            _question_duration.observe(time.time() - start_time)
+            _questions_total.labels(status='success').inc()
+            return response.content
+        except Exception as e:
+            _questions_total.labels(status='error').inc()
+            return f"Error: {e}"
+
+# --- Watchdog Logic ---
+class PDFWatchdog(FileSystemEventHandler):
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+    def on_created(self, event):
+        if not event.is_directory and event.src_path.endswith(".pdf"):
+            time.sleep(1)
+            self.pipeline.process_single_pdf(event.src_path)
+
+def start_watchdog(pipeline):
+    event_handler = PDFWatchdog(pipeline)
+    observer = Observer()
+    observer.schedule(event_handler, str(pipeline.data_folder), recursive=False)
+    observer.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
 
 if __name__ == "__main__":
-    main()
+    pipeline = RAGPipeline()
+    start_http_server(8000)
+    watchdog_thread = threading.Thread(target=start_watchdog, args=(pipeline,), daemon=True)
+    watchdog_thread.start()
+    print("🚀 System Ready!")
+    while True:
+        query = input("\n🔍 Question: ")
+        if query.lower() in ['q', 'exit']: break
+        print(f"\n📢 Answer: {pipeline.ask_question(query)}")

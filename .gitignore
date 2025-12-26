@@ -43,3 +43,7 @@ Thumbs.db
 # Logs
 *.log
 
+# Monitoring
+prometheus_data/
+grafana_data/
+
